@@ -22,7 +22,6 @@ import time
 import traceback
 from datetime import datetime, timezone
 from io import BytesIO
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -49,6 +48,9 @@ CHECKPOINT_FILE = "scraper_checkpoint.json"
 PROGRESS_FILE = "scraper_progress.json"
 MODEL_NAME = "google/siglip-base-patch16-384"
 EMBEDDING_DIM = 768
+BATCH_SIZE = 50
+STALE_THRESHOLD = 2  # Consecutive runs without being seen before deletion
+STAGGER_DELAY = 0.5  # Seconds between embedding API calls
 
 # Concurrency
 MAX_CONCURRENT_FETCHES = 5
@@ -57,6 +59,9 @@ MAX_CONCURRENT_EMBEDDINGS = 2  # GPU memory — keep low
 # Retry
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0
+
+# Logging
+FAILED_LOG_FILE = "scraper_failed_products.jsonl"
 
 # Headers
 HEADERS = {
@@ -106,6 +111,49 @@ def save_checkpoint(checkpoint: dict) -> None:
 def save_progress(stats: dict) -> None:
     with open(PROGRESS_FILE, "w") as f:
         json.dump(stats, f, indent=2, default=str)
+
+
+def product_changed(scraped: dict, existing: dict) -> bool:
+    """
+    Check if scraped product data differs from the existing database record.
+    Returns True if any tracked field has changed.
+    """
+    # Compare scalar fields that matter for updates
+    compare_fields = [
+        "title", "description", "price", "sale", "image_url",
+        "additional_images", "category", "size", "brand",
+        "gender", "affiliate_url",
+    ]
+    for field in compare_fields:
+        if scraped.get(field) != existing.get(field):
+            log.debug(f"  Change detected in '{field}'")
+            return True
+
+    # Compare tags (order-independent)
+    scraped_tags = set(scraped.get("tags") or [])
+    existing_tags = set(existing.get("tags") or [])
+    if scraped_tags != existing_tags:
+        log.debug("  Change detected in 'tags'")
+        return True
+
+    # Compare metadata (JSON string — parse to compare variants, availability, etc.)
+    try:
+        scraped_meta = json.loads(scraped.get("metadata", "{}"))
+        existing_meta = json.loads(existing.get("metadata", "{}"))
+        # Compare relevant sub-structures
+        for meta_key in ["variants", "sizes", "category"]:
+            if scraped_meta.get(meta_key) != existing_meta.get(meta_key):
+                log.debug(f"  Change detected in metadata.{meta_key}")
+                return True
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        pass
+
+    return False
+
+
+def image_url_changed(scraped: dict, existing: dict) -> bool:
+    """Check if the product's main image URL has changed."""
+    return scraped.get("image_url") != existing.get("image_url")
 
 
 def extract_json_ld(soup: BeautifulSoup) -> dict | None:
@@ -482,8 +530,9 @@ class ProductScraper:
 
         product_id = make_id(self.url)
 
+        # Sort for deterministic comparison across runs
         additional_images_str = (
-            " , ".join(additional_imgs) if additional_imgs else None
+            " , ".join(sorted(additional_imgs)) if additional_imgs else None
         )
 
         record = {
@@ -614,7 +663,10 @@ class EmbeddingGenerator:
 # ---------------------------------------------------------------------------
 
 class SupabaseUploader:
-    """Upload product records to Supabase."""
+    """
+    Upload product records to Supabase with batch upsert support,
+    stale product cleanup, and error logging.
+    """
 
     def __init__(self) -> None:
         log.info("Connecting to Supabase...")
@@ -626,14 +678,144 @@ class SupabaseUploader:
         except Exception as e:
             log.warning(f"Could not verify Supabase connection: {e}")
 
-    def upsert(self, record: dict) -> bool:
-        """Upsert a single product record. Returns True on success."""
+    def fetch_existing_products(self, source: str) -> list[dict]:
+        """Fetch ALL existing products for a given source."""
         try:
-            result = self.client.table("products").upsert(record, on_conflict="id").execute()
-            return True
+            result = self.client.table("products").select("*").eq("source", source).execute()
+            data = result.data or []
+            log.info(f"Fetched {len(data)} existing products for source '{source}'.")
+            return data
         except Exception as e:
-            log.error(f"Supabase upsert failed: {e}")
-            return False
+            log.error(f"Failed to fetch existing products: {e}")
+            return []
+
+    def batch_upsert(self, records: list[dict], batch_size: int = 50) -> tuple[int, int]:
+        """
+        Upsert records in batches. Returns (success_count, fail_count).
+        Retries failed batches up to MAX_RETRIES times before logging
+        the failed products to a local file.
+        """
+        if not records:
+            return 0, 0
+
+        success_count = 0
+        fail_count = 0
+        total_batches = (len(records) + batch_size - 1) // batch_size
+
+        for i in range(0, len(records), batch_size):
+            batch = records[i:i + batch_size]
+            batch_num = i // batch_size + 1
+            batch_ok = False
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    self.client.table("products").upsert(
+                        batch, on_conflict="source,product_url"
+                    ).execute()
+                    success_count += len(batch)
+                    if total_batches > 1:
+                        log.info(f"  Batch {batch_num}/{total_batches} upserted ({len(batch)} products).")
+                    batch_ok = True
+                    break
+                except Exception as e:
+                    log.warning(
+                        f"  Batch {batch_num}/{total_batches} "
+                        f"attempt {attempt}/{MAX_RETRIES} failed: {e}"
+                    )
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY * attempt)
+
+            if not batch_ok:
+                fail_count += len(batch)
+                self._log_failed_products(batch, "All retries exhausted")
+                log.error(
+                    f"  Batch {batch_num}/{total_batches} FAILED after "
+                    f"{MAX_RETRIES} attempts. Products logged to {FAILED_LOG_FILE}."
+                )
+
+        return success_count, fail_count
+
+    def _log_failed_products(self, records: list[dict], error: str) -> None:
+        """Append failed product records to a JSONL log file."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        lines = []
+        for rec in records:
+            entry = {
+                "timestamp": timestamp,
+                "error": error,
+                "source": rec.get("source"),
+                "product_url": rec.get("product_url"),
+                "id": rec.get("id"),
+                "title": rec.get("title"),
+            }
+            lines.append(json.dumps(entry))
+        try:
+            with open(FAILED_LOG_FILE, "a") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as log_err:
+            log.error(f"  Failed to write error log: {log_err}")
+
+    def cleanup_stale_products(self, source: str, seen_urls: set[str]) -> int:
+        """
+        Identify and handle stale products for this source.
+        Products not seen this run get their consecutive_misses incremented.
+        Products with consecutive_misses >= STALE_THRESHOLD get deleted.
+        Returns the number of deleted products.
+        """
+        try:
+            result = self.client.table("products").select(
+                "id, product_url, consecutive_misses"
+            ).eq("source", source).execute()
+            existing = result.data or []
+        except Exception as e:
+            log.error(f"Failed to fetch products for stale cleanup: {e}")
+            return 0
+
+        if not existing:
+            return 0
+
+        miss_updates: list[dict] = []
+        delete_ids: list[str] = []
+
+        for product in existing:
+            url = product.get("product_url", "")
+            if url not in seen_urls:
+                misses = (product.get("consecutive_misses") or 0) + 1
+                pid = product["id"]
+                if misses >= STALE_THRESHOLD:
+                    delete_ids.append(pid)
+                else:
+                    miss_updates.append({
+                        "id": pid,
+                        "consecutive_misses": misses,
+                    })
+
+        # Update miss counters for products not yet stale
+        for update in miss_updates:
+            try:
+                self.client.table("products").update({
+                    "consecutive_misses": update["consecutive_misses"],
+                }).eq("id", update["id"]).execute()
+            except Exception as e:
+                log.warning(f"  Failed to update misses for {update['id']}: {e}")
+
+        if miss_updates:
+            log.info(f"  Incremented misses for {len(miss_updates)} unseen products.")
+
+        # Delete stale products (deleted in batches of 50)
+        deleted_count = 0
+        for i in range(0, len(delete_ids), 50):
+            batch = delete_ids[i:i + 50]
+            try:
+                self.client.table("products").delete().in_("id", batch).execute()
+                deleted_count += len(batch)
+            except Exception as e:
+                log.error(f"  Failed to delete batch of {len(batch)} products: {e}")
+
+        if delete_ids:
+            log.info(f"  Deleted {deleted_count}/{len(delete_ids)} stale products.")
+
+        return deleted_count
 
 
 # ---------------------------------------------------------------------------
@@ -772,13 +954,13 @@ class AkimboScraper:
 
     # ---- Processing pipeline ----
 
-    async def process_product(self, url: str) -> dict | None:
-        """Scrape, embed, and upload a single product."""
-        # Check if already done
+    async def process_product(self, url: str, existing_by_url: dict) -> dict | None:
+        """
+        Scrape a single product page, compare against existing DB record,
+        generate embeddings only if needed, and return structured result.
+        Returns None on failure, or a dict with status ("new"/"updated"/"skipped") and record.
+        """
         pid = make_id(url)
-        if pid in self.checkpoint.get("done", []):
-            log.info(f"Skipping already done: {url.split('/')[-1]}")
-            return None
 
         log.info(f"--- Processing: {url.split('/')[-1]} ---")
 
@@ -798,75 +980,129 @@ class AkimboScraper:
             save_checkpoint(self.checkpoint)
             return None
 
-        # 3. Generate image embedding
-        image_url = record.get("image_url")
-        if image_url:
-            log.info("  Generating image embedding...")
-            async with self._sem_embed:
-                img = await self.fetch_image(image_url)
-                if img:
-                    try:
-                        emb = self.embedder.embed_image(img)
-                        record["image_embedding"] = emb
-                        log.info(f"  Image embedding done (dim={len(emb)})")
-                    except Exception as e:
-                        log.error(f"  Image embedding failed: {e}")
-                        traceback.print_exc()
+        # 3. Check if product already exists and whether anything changed
+        existing = existing_by_url.get(url)
+        if existing:
+            # Preserve the original created_at timestamp
+            record["created_at"] = existing.get("created_at", record["created_at"])
 
-        # 4. Generate text info embedding
-        info_text = self.embedder.make_info_text(record)
-        log.info("  Generating text info embedding...")
-        try:
-            text_emb = self.embedder.embed_text(info_text)
-            record["info_embedding"] = text_emb
-            log.info(f"  Text embedding done (dim={len(text_emb)})")
-        except Exception as e:
-            log.error(f"  Text embedding failed: {e}")
-            traceback.print_exc()
+            if not product_changed(record, existing):
+                log.info(f"  Product unchanged — skipping entirely.")
+                return {"status": "skipped", "record": None}
+            else:
+                log.info(f"  Product changed — will update.")
 
-        # 5. Upload to Supabase
-        if self.uploader.upsert(record):
-            self.checkpoint.setdefault("done", []).append(pid)
-            save_checkpoint(self.checkpoint)
-            self.stats["uploaded"] += 1
-            log.info(f"  Uploaded to Supabase.")
+        # 4. Set tracking fields
+        record["last_seen"] = datetime.now(timezone.utc).isoformat()
+        record["consecutive_misses"] = 0
+
+        # 5. Generate embeddings only if new or the image URL has changed
+        needs_embeddings = existing is None or image_url_changed(record, existing)
+
+        if needs_embeddings:
+            # Image embedding
+            image_url = record.get("image_url")
+            if image_url:
+                log.info("  Generating image embedding...")
+                async with self._sem_embed:
+                    img = await self.fetch_image(image_url)
+                    if img:
+                        try:
+                            emb = self.embedder.embed_image(img)
+                            record["image_embedding"] = emb
+                            log.info(f"  Image embedding done (dim={len(emb)})")
+                        except Exception as e:
+                            log.error(f"  Image embedding failed: {e}")
+                            traceback.print_exc()
+                await asyncio.sleep(STAGGER_DELAY)
+
+            # Text info embedding
+            info_text = self.embedder.make_info_text(record)
+            log.info("  Generating text info embedding...")
+            try:
+                text_emb = self.embedder.embed_text(info_text)
+                record["info_embedding"] = text_emb
+                log.info(f"  Text embedding done (dim={len(text_emb)})")
+            except Exception as e:
+                log.error(f"  Text embedding failed: {e}")
+                traceback.print_exc()
+            await asyncio.sleep(STAGGER_DELAY)
         else:
-            self.checkpoint.setdefault("failed", []).append(pid)
-            save_checkpoint(self.checkpoint)
-            log.error(f"  Upload FAILED.")
+            log.info("  Image URL unchanged — keeping existing embeddings.")
+            record["image_embedding"] = existing.get("image_embedding")
+            record["info_embedding"] = existing.get("info_embedding")
 
-        self.stats["scraped"] += 1
-        return record
+        status = "new" if existing is None else "updated"
+        return {"status": status, "record": record}
 
     async def run(self) -> None:
-        """Run the full scraping pipeline."""
+        """Run the full scraping pipeline with batch upsert and stale cleanup."""
         log.info("=" * 60)
         log.info("AKIMBO CLUB SCRAPER")
         log.info("=" * 60)
 
-        # Get product URLs
+        # 1. Fetch existing products for comparison and upsert targeting
+        existing_products = self.uploader.fetch_existing_products(SOURCE_NAME)
+        existing_by_url: dict[str, dict] = {p["product_url"]: p for p in existing_products}
+        log.info(f"Loaded {len(existing_products)} existing products from DB.")
+
+        # 2. Get product URLs from collection page
         all_urls = await self.get_product_urls()
+        seen_urls: set[str] = set()
         if self.limit:
-            # Filter out already done ones first
-            remaining = [u for u in all_urls if make_id(u) not in self.checkpoint.get("done", [])]
-            all_urls = all_urls[:self.limit] + remaining[:max(0, self.limit - len(all_urls))] if self.limit else all_urls
             all_urls = all_urls[:self.limit]
 
         self.stats["total_products"] = len(all_urls)
         log.info(f"Will process {len(all_urls)} products")
 
-        # Process products one by one (to keep memory manageable)
+        # 3. Process products — collect into batches
+        upsert_batch: list[dict] = []
+        stats_new = 0
+        stats_updated = 0
+        stats_skipped = 0
+
         start_time = time.time()
+
         for i, url in enumerate(all_urls, 1):
             pid = make_id(url)
             if pid in self.checkpoint.get("done", []):
                 log.info(f"[{i}/{len(all_urls)}] Already done, skipping: {url.split('/')[-1]}")
+                stats_skipped += 1
+                seen_urls.add(url)
                 continue
 
             log.info(f"[{i}/{len(all_urls)}] Processing...")
-            await self.process_product(url)
+            result = await self.process_product(url, existing_by_url)
 
-            # Progress update
+            if result is None:
+                # Fetch or parse failure
+                continue
+
+            seen_urls.add(url)
+
+            if result["status"] == "skipped":
+                stats_skipped += 1
+                # Update checkpoint — mark as done even if unchanged
+                self.checkpoint.setdefault("done", []).append(pid)
+                save_checkpoint(self.checkpoint)
+            else:
+                upsert_batch.append(result["record"])
+                if result["status"] == "new":
+                    stats_new += 1
+                else:
+                    stats_updated += 1
+
+            # Flush batch when it reaches BATCH_SIZE
+            if len(upsert_batch) >= BATCH_SIZE:
+                succ, _ = self.uploader.batch_upsert(upsert_batch)
+                for rec in upsert_batch[:succ]:
+                    rec_pid = rec["id"]
+                    if rec_pid not in self.checkpoint.get("done", []):
+                        self.checkpoint.setdefault("done", []).append(rec_pid)
+                save_checkpoint(self.checkpoint)
+                upsert_batch = []
+
+            # Periodic progress update
             elapsed = time.time() - start_time
             done_count = len(self.checkpoint.get("done", []))
             rate = done_count / elapsed if elapsed > 0 else 0
@@ -876,17 +1112,41 @@ class AkimboScraper:
             self.stats["eta_seconds"] = round(eta)
             save_progress(self.stats)
 
-        # Final stats
+        # 4. Flush remaining batch
+        if upsert_batch:
+            succ, _ = self.uploader.batch_upsert(upsert_batch)
+            for rec in upsert_batch[:succ]:
+                rec_pid = rec["id"]
+                if rec_pid not in self.checkpoint.get("done", []):
+                    self.checkpoint.setdefault("done", []).append(rec_pid)
+            save_checkpoint(self.checkpoint)
+
+        # 5. Clean up stale products
+        log.info("=" * 60)
+        log.info("STALE PRODUCT CLEANUP")
+        log.info("=" * 60)
+        stats_deleted = self.uploader.cleanup_stale_products(SOURCE_NAME, seen_urls)
+
+        # 6. Print run summary
         elapsed = time.time() - start_time
         log.info("=" * 60)
-        log.info(f"DONE! Elapsed: {elapsed:.1f}s")
-        log.info(f"  Total found:  {self.stats['total_products']}")
-        log.info(f"  Scraped:      {self.stats['scraped']}")
-        log.info(f"  Uploaded:     {self.stats['uploaded']}")
-        log.info(f"  Failed:       {len(self.checkpoint.get('failed', []))}")
+        log.info("RUN SUMMARY")
+        log.info("=" * 60)
+        log.info(f"  New products added:     {stats_new}")
+        log.info(f"  Products updated:      {stats_updated}")
+        log.info(f"  Products unchanged:    {stats_skipped}")
+        log.info(f"  Stale products deleted: {stats_deleted}")
+        log.info(f"  Elapsed:               {elapsed:.1f}s")
         log.info("=" * 60)
 
-        save_progress({**self.stats, "finished_at": datetime.now(timezone.utc).isoformat()})
+        save_progress({
+            **self.stats,
+            "new": stats_new,
+            "updated": stats_updated,
+            "skipped": stats_skipped,
+            "deleted": stats_deleted,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
 
 
 # ---------------------------------------------------------------------------
