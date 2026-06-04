@@ -262,10 +262,12 @@ class ProductScraper:
                                 if isinstance(v, dict):
                                     p = v.get("price")
                                     if p is not None:
-                                        prices.append(float(p))
+                                        # Shopify Analytics stores prices in cents
+                                        prices.append(float(p) / 100.0)
                                     cp = v.get("compare_at_price")
                                     if cp is not None and float(cp) > 0:
-                                        compare_prices.append(float(cp))
+                                        # Shopify Analytics stores prices in cents
+                                        compare_prices.append(float(cp) / 100.0)
                             if prices:
                                 regular_price = min(prices)
                             if compare_prices:
