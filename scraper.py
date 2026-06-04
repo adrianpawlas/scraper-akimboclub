@@ -49,7 +49,6 @@ PROGRESS_FILE = "scraper_progress.json"
 MODEL_NAME = "google/siglip-base-patch16-384"
 EMBEDDING_DIM = 768
 BATCH_SIZE = 50
-STALE_THRESHOLD = 2  # Consecutive runs without being seen before deletion
 STAGGER_DELAY = 0.5  # Seconds between embedding API calls
 
 # Concurrency
@@ -757,14 +756,13 @@ class SupabaseUploader:
 
     def cleanup_stale_products(self, source: str, seen_urls: set[str]) -> int:
         """
-        Identify and handle stale products for this source.
-        Products not seen this run get their consecutive_misses incremented.
-        Products with consecutive_misses >= STALE_THRESHOLD get deleted.
+        Identify and delete stale products — those that exist in the DB
+        for this source but were NOT found on the collection page this run.
         Returns the number of deleted products.
         """
         try:
             result = self.client.table("products").select(
-                "id, product_url, consecutive_misses"
+                "id, product_url"
             ).eq("source", source).execute()
             existing = result.data or []
         except Exception as e:
@@ -774,35 +772,12 @@ class SupabaseUploader:
         if not existing:
             return 0
 
-        miss_updates: list[dict] = []
-        delete_ids: list[str] = []
+        delete_ids: list[str] = [
+            p["id"] for p in existing
+            if p.get("product_url", "") not in seen_urls
+        ]
 
-        for product in existing:
-            url = product.get("product_url", "")
-            if url not in seen_urls:
-                misses = (product.get("consecutive_misses") or 0) + 1
-                pid = product["id"]
-                if misses >= STALE_THRESHOLD:
-                    delete_ids.append(pid)
-                else:
-                    miss_updates.append({
-                        "id": pid,
-                        "consecutive_misses": misses,
-                    })
-
-        # Update miss counters for products not yet stale
-        for update in miss_updates:
-            try:
-                self.client.table("products").update({
-                    "consecutive_misses": update["consecutive_misses"],
-                }).eq("id", update["id"]).execute()
-            except Exception as e:
-                log.warning(f"  Failed to update misses for {update['id']}: {e}")
-
-        if miss_updates:
-            log.info(f"  Incremented misses for {len(miss_updates)} unseen products.")
-
-        # Delete stale products (deleted in batches of 50)
+        # Delete stale products in batches of 50
         deleted_count = 0
         for i in range(0, len(delete_ids), 50):
             batch = delete_ids[i:i + 50]
@@ -994,7 +969,6 @@ class AkimboScraper:
 
         # 4. Set tracking fields
         record["last_seen"] = datetime.now(timezone.utc).isoformat()
-        record["consecutive_misses"] = 0
 
         # 5. Generate embeddings only if new or the image URL has changed
         needs_embeddings = existing is None or image_url_changed(record, existing)
