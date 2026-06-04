@@ -1,0 +1,96 @@
+name: Akimbo Club Scraper
+
+on:
+  schedule:
+    # Monday 3:30 PM CET/CEST — two crons to handle DST transitions
+    # 1:30 PM UTC = 3:30 PM CEST (summer)
+    # 2:30 PM UTC = 3:30 PM CET (winter)
+    - cron: "30 13 * * 1"
+    - cron: "30 14 * * 1"
+  workflow_dispatch:  # Allows manual trigger from GitHub UI
+    inputs:
+      limit:
+        description: "Limit number of products to scrape (leave empty for all)"
+        required: false
+        type: number
+        default: 0
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libxml2-dev libxslt-dev
+        shell: bash
+
+      - name: Cache HuggingFace models
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: siglip-model-${{ runner.os }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+        shell: bash
+
+      - name: Verify imports
+        run: |
+          python -c "
+          import httpx
+          import bs4
+          import lxml
+          import numpy
+          import PIL
+          import torch
+          import transformers
+          import supabase
+          print('All imports OK')
+          "
+        shell: bash
+
+      - name: Load SigLIP model (cache warm-up)
+        run: |
+          python -c "
+          from transformers import SiglipModel, SiglipProcessor
+          m = SiglipModel.from_pretrained('google/siglip-base-patch16-384')
+          p = SiglipProcessor.from_pretrained('google/siglip-base-patch16-384')
+          print('Model loaded OK')
+          "
+        shell: bash
+
+      - name: Run scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if [ "${{ github.event.inputs.limit }}" != "" ] && [ "${{ github.event.inputs.limit }}" != "0" ]; then
+            python scraper.py --limit "${{ github.event.inputs.limit }}"
+          else
+            python scraper.py
+          fi
+        shell: bash
+
+      - name: Upload checkpoint and progress (artifact)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scraper-state
+          path: |
+            scraper_checkpoint.json
+            scraper_progress.json
+          overwrite: true
+          retention-days: 30

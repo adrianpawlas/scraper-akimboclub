@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.env
+.venv
+venv/
+env/
+ENV/
+
+# Checkpoint & progress (generated at runtime, unique per run)
+scraper_checkpoint.json
+scraper_progress.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# HuggingFace cache (downloaded locally)
+.cache/
