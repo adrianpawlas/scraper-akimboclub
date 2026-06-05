@@ -967,10 +967,7 @@ class AkimboScraper:
             else:
                 log.info(f"  Product changed — will update.")
 
-        # 4. Set tracking fields
-        record["last_seen"] = datetime.now(timezone.utc).isoformat()
-
-        # 5. Generate embeddings only if new or the image URL has changed
+        # 4. Generate embeddings only if new or the image URL has changed
         needs_embeddings = existing is None or image_url_changed(record, existing)
 
         if needs_embeddings:
