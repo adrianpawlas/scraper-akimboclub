@@ -629,7 +629,6 @@ class ProductScraper:
             "second_hand": False,
             "image_embedding": None,  # Will be filled later
             "back_image_embedding": None,  # Will be filled later (nullable)
-            "embedding_version": None,  # Will be set to 2 when front embed is generated
             "country": None,
             "compressed_image_url": None,
             "tags": tags,
@@ -1075,9 +1074,8 @@ class AkimboScraper:
                         try:
                             emb = self.embedder.embed_image(img)
                             record["image_embedding"] = emb
-                            record["embedding_version"] = 2
                             embeds_generated["front"] = True
-                            log.info(f"  Front image embedding done (dim={len(emb)}, version=2)")
+                            log.info(f"  Front image embedding done (dim={len(emb)})")
                         except Exception as e:
                             log.error(f"  Front image embedding failed: {e}")
                             traceback.print_exc()
@@ -1131,9 +1129,8 @@ class AkimboScraper:
                             try:
                                 emb = self.embedder.embed_image(img)
                                 record["image_embedding"] = emb
-                                record["embedding_version"] = 2
                                 embeds_generated["front"] = True
-                                log.info(f"  Front image embedding done (dim={len(emb)}, version=2)")
+                                log.info(f"  Front image embedding done (dim={len(emb)})")
                             except Exception as e:
                                 log.error(f"  Front image embedding failed: {e}")
                                 traceback.print_exc()
@@ -1144,7 +1141,6 @@ class AkimboScraper:
                 # Keep existing front embedding
                 log.info("  Front image URL unchanged — keeping existing embedding.")
                 record["image_embedding"] = existing.get("image_embedding")
-                record["embedding_version"] = existing.get("embedding_version", 2)
 
             # 5b. Back image: re-embed only if back_image_url changed
             if back_image_url_changed(record, existing):
