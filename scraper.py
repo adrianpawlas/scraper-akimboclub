@@ -120,7 +120,7 @@ def product_changed(scraped: dict, existing: dict) -> bool:
     # Compare scalar fields that matter for updates
     compare_fields = [
         "title", "description", "price", "sale", "image_url",
-        "additional_images", "category", "size", "brand",
+        "back_image_url", "additional_images", "category", "size", "brand",
         "gender", "affiliate_url",
     ]
     for field in compare_fields:
@@ -153,6 +153,39 @@ def product_changed(scraped: dict, existing: dict) -> bool:
 def image_url_changed(scraped: dict, existing: dict) -> bool:
     """Check if the product's main image URL has changed."""
     return scraped.get("image_url") != existing.get("image_url")
+
+
+def back_image_url_changed(scraped: dict, existing: dict) -> bool:
+    """Check if the back-view image URL has changed (added, removed, or different)."""
+    scraped_back = scraped.get("back_image_url")
+    existing_back = existing.get("back_image_url")
+    if scraped_back == existing_back:
+        return False
+    log.debug(f"  Change detected in 'back_image_url': '{existing_back}' -> '{scraped_back}'")
+    return True
+
+
+def text_fields_changed(scraped: dict, existing: dict) -> bool:
+    """Check if any text fields that affect info_embedding have changed.
+    This excludes image URLs, embeddings, and the metadata JSON blob
+    (which may embed back_image_url and other non-text changes)."""
+    text_fields = [
+        "title", "description", "category", "gender",
+        "price", "sale", "size", "brand",
+    ]
+    for field in text_fields:
+        if scraped.get(field) != existing.get(field):
+            log.debug(f"  Text field changed: '{field}'")
+            return True
+
+    # Compare tags (order-independent)
+    scraped_tags = set(scraped.get("tags") or [])
+    existing_tags = set(existing.get("tags") or [])
+    if scraped_tags != existing_tags:
+        log.debug("  Text field changed: 'tags'")
+        return True
+
+    return False
 
 
 def extract_json_ld(soup: BeautifulSoup) -> dict | None:
@@ -284,6 +317,44 @@ class ProductScraper:
         main = all_image_urls[0] if all_image_urls else None
         additional = all_image_urls[1:] if len(all_image_urls) > 1 else []
         return main, additional
+
+    def extract_back_image_url(self, all_image_urls: list[str]) -> str | None:
+        """
+        Detect a back-view image from the full list of product images.
+        Detection rules (in priority order):
+          1. First image whose alt text contains 'back', 'rear', or 'reverse'
+             (case-insensitive) — scraped from <img> tags.
+          2. Second image in the gallery if 2+ images exist (Shopify convention
+             where front is #1, back is #2).
+          3. None if only 1 image exists.
+        Never returns the same URL as the front (first) image.
+        """
+        if len(all_image_urls) < 2:
+            return None
+
+        # Rule 1: Check alt text on img tags for back indicators
+        back_keywords = {"back", "rear", "reverse", "behind"}
+        for img in self.soup.find_all("img"):
+            alt = (img.get("alt", "") or "").strip().lower()
+            if any(kw in alt for kw in back_keywords):
+                # Resolve to the canonical URL
+                for attr in ["src", "data-src", "data-original"]:
+                    val = img.get(attr, "")
+                    if val:
+                        clean = val.split("?")[0].split("&")[0]
+                        clean = clean.replace("_{width}x", "")
+                        if clean in all_image_urls and clean != all_image_urls[0]:
+                            return clean
+                        # Also check without normalization
+                        if val.split("?")[0] in all_image_urls and val.split("?")[0] != all_image_urls[0]:
+                            return val.split("?")[0]
+
+        # Rule 2: Second image in gallery is typically the back view
+        second = all_image_urls[1]
+        if second != all_image_urls[0]:
+            return second
+
+        return None
 
     def extract_prices(self) -> tuple[str | None, str | None]:
         """
@@ -487,6 +558,7 @@ class ProductScraper:
         title = self.extract_title()
         description = self.extract_description()
         main_img, additional_imgs = self.extract_image_urls()
+        back_img = self.extract_back_image_url([main_img] + additional_imgs if main_img else additional_imgs)
         price, sale = self.extract_prices()
         category = self.extract_category()
 
@@ -502,6 +574,7 @@ class ProductScraper:
             "category": category or "",
             "product_url": self.url,
             "image_url": main_img or "",
+            "back_image_url": back_img or "",
             "additional_images": additional_imgs,
             "source": SOURCE_NAME,
             "brand": BRAND_NAME,
@@ -517,6 +590,7 @@ class ProductScraper:
         title = self.extract_title()
         description = self.extract_description()
         main_img, additional_imgs = self.extract_image_urls()
+        back_img = self.extract_back_image_url([main_img] + additional_imgs if main_img else additional_imgs)
         price, sale = self.extract_prices()
         category = self.extract_category()
         sizes = self.extract_sizes()
@@ -530,6 +604,8 @@ class ProductScraper:
         product_id = make_id(self.url)
 
         # Sort for deterministic comparison across runs
+        # back_image_url is already included in additional_imgs, but we also
+        # store it separately for dedicated back-view embedding
         additional_images_str = (
             " , ".join(sorted(additional_imgs)) if additional_imgs else None
         )
@@ -540,6 +616,7 @@ class ProductScraper:
             "product_url": self.url,
             "affiliate_url": None,
             "image_url": main_img or "",
+            "back_image_url": back_img or None,  # Dedicated back-view column (nullable)
             "brand": BRAND_NAME,
             "title": title,
             "description": description,
@@ -551,6 +628,8 @@ class ProductScraper:
             "size": sizes,
             "second_hand": False,
             "image_embedding": None,  # Will be filled later
+            "back_image_embedding": None,  # Will be filled later (nullable)
+            "embedding_version": None,  # Will be set to 2 when front embed is generated
             "country": None,
             "compressed_image_url": None,
             "tags": tags,
@@ -934,6 +1013,14 @@ class AkimboScraper:
         Scrape a single product page, compare against existing DB record,
         generate embeddings only if needed, and return structured result.
         Returns None on failure, or a dict with status ("new"/"updated"/"skipped") and record.
+
+        Embedding rules (requirement #3):
+        - image_embedding: regenerate ONLY if product is new OR image_url changed
+        - back_image_embedding: regenerate ONLY if product is new with back_image_url,
+          OR back_image_url changed (added/removed/different URL)
+        - info_embedding: regenerate ONLY if text fields changed (title, description,
+          category, gender, price, sale, size, brand, tags, metadata)
+        - Unchanged products: skip DB write AND skip all embed API calls
         """
         pid = make_id(url)
 
@@ -962,30 +1049,59 @@ class AkimboScraper:
             record["created_at"] = existing.get("created_at", record["created_at"])
 
             if not product_changed(record, existing):
-                log.info(f"  Product unchanged — skipping entirely.")
+                log.info(f"  Product unchanged — skipping entirely (no DB write, no embed API calls).")
                 return {"status": "skipped", "record": None}
             else:
-                log.info(f"  Product changed — will update.")
+                log.info(f"  Product changed — computing minimal updates.")
 
-        # 4. Generate embeddings only if new or the image URL has changed
-        needs_embeddings = existing is None or image_url_changed(record, existing)
+        # 4. Set tracking fields
+        record["last_seen"] = datetime.now(timezone.utc).isoformat()
 
-        if needs_embeddings:
-            # Image embedding
-            image_url = record.get("image_url")
-            if image_url:
-                log.info("  Generating image embedding...")
+        # Track which embeds we generate for the run summary
+        embeds_generated = {"front": False, "back": False, "info": False}
+
+        # 5. Smart embedding logic — re-embed ONLY what changed
+        if existing is None:
+            # --- NEW PRODUCT: embed everything ---
+            log.info("  New product — generating all embeddings.")
+
+            # Front image embedding
+            front_url = record.get("image_url")
+            if front_url:
+                log.info("  Generating front image embedding...")
                 async with self._sem_embed:
-                    img = await self.fetch_image(image_url)
+                    img = await self.fetch_image(front_url)
                     if img:
                         try:
                             emb = self.embedder.embed_image(img)
                             record["image_embedding"] = emb
-                            log.info(f"  Image embedding done (dim={len(emb)})")
+                            record["embedding_version"] = 2
+                            embeds_generated["front"] = True
+                            log.info(f"  Front image embedding done (dim={len(emb)}, version=2)")
                         except Exception as e:
-                            log.error(f"  Image embedding failed: {e}")
+                            log.error(f"  Front image embedding failed: {e}")
                             traceback.print_exc()
                 await asyncio.sleep(STAGGER_DELAY)
+
+            # Back image embedding (optional)
+            back_url = record.get("back_image_url")
+            if back_url:
+                log.info("  Generating back image embedding...")
+                async with self._sem_embed:
+                    back_img = await self.fetch_image(back_url)
+                    if back_img:
+                        try:
+                            emb = self.embedder.embed_image(back_img)
+                            record["back_image_embedding"] = emb
+                            embeds_generated["back"] = True
+                            log.info(f"  Back image embedding done (dim={len(emb)})")
+                        except Exception as e:
+                            log.error(f"  Back image embedding failed: {e}")
+                            traceback.print_exc()
+                await asyncio.sleep(STAGGER_DELAY)
+            else:
+                record["back_image_url"] = None
+                record["back_image_embedding"] = None
 
             # Text info embedding
             info_text = self.embedder.make_info_text(record)
@@ -993,18 +1109,88 @@ class AkimboScraper:
             try:
                 text_emb = self.embedder.embed_text(info_text)
                 record["info_embedding"] = text_emb
-                log.info(f"  Text embedding done (dim={len(text_emb)})")
+                embeds_generated["info"] = True
+                log.info(f"  Text info embedding done (dim={len(text_emb)})")
             except Exception as e:
-                log.error(f"  Text embedding failed: {e}")
+                log.error(f"  Text info embedding failed: {e}")
                 traceback.print_exc()
             await asyncio.sleep(STAGGER_DELAY)
+
         else:
-            log.info("  Image URL unchanged — keeping existing embeddings.")
-            record["image_embedding"] = existing.get("image_embedding")
-            record["info_embedding"] = existing.get("info_embedding")
+            # --- EXISTING PRODUCT: only re-embed what changed ---
+            log.info("  Updating existing product — selective re-embedding.")
+
+            # 5a. Front image: re-embed only if image_url changed
+            if image_url_changed(record, existing):
+                front_url = record.get("image_url")
+                if front_url:
+                    log.info("  Front image URL changed — re-embedding.")
+                    async with self._sem_embed:
+                        img = await self.fetch_image(front_url)
+                        if img:
+                            try:
+                                emb = self.embedder.embed_image(img)
+                                record["image_embedding"] = emb
+                                record["embedding_version"] = 2
+                                embeds_generated["front"] = True
+                                log.info(f"  Front image embedding done (dim={len(emb)}, version=2)")
+                            except Exception as e:
+                                log.error(f"  Front image embedding failed: {e}")
+                                traceback.print_exc()
+                    await asyncio.sleep(STAGGER_DELAY)
+                else:
+                    record["image_embedding"] = None
+            else:
+                # Keep existing front embedding
+                log.info("  Front image URL unchanged — keeping existing embedding.")
+                record["image_embedding"] = existing.get("image_embedding")
+                record["embedding_version"] = existing.get("embedding_version", 2)
+
+            # 5b. Back image: re-embed only if back_image_url changed
+            if back_image_url_changed(record, existing):
+                back_url = record.get("back_image_url")
+                if back_url:
+                    log.info("  Back image URL changed — re-embedding.")
+                    async with self._sem_embed:
+                        back_img = await self.fetch_image(back_url)
+                        if back_img:
+                            try:
+                                emb = self.embedder.embed_image(back_img)
+                                record["back_image_embedding"] = emb
+                                embeds_generated["back"] = True
+                                log.info(f"  Back image embedding done (dim={len(emb)})")
+                            except Exception as e:
+                                log.error(f"  Back image embedding failed: {e}")
+                                traceback.print_exc()
+                    await asyncio.sleep(STAGGER_DELAY)
+                else:
+                    # Back image was removed — clear both columns
+                    log.info("  Back image URL removed — clearing back columns.")
+                    record["back_image_url"] = None
+                    record["back_image_embedding"] = None
+            else:
+                # Keep existing back embedding
+                record["back_image_embedding"] = existing.get("back_image_embedding")
+
+            # 5c. Text info: re-embed only if text fields changed
+            if text_fields_changed(record, existing):
+                log.info("  Text fields changed — re-embedding info embedding.")
+                info_text = self.embedder.make_info_text(record)
+                try:
+                    text_emb = self.embedder.embed_text(info_text)
+                    record["info_embedding"] = text_emb
+                    embeds_generated["info"] = True
+                    log.info(f"  Text info embedding done (dim={len(text_emb)})")
+                except Exception as e:
+                    log.error(f"  Text info embedding failed: {e}")
+                    traceback.print_exc()
+                await asyncio.sleep(STAGGER_DELAY)
+            else:
+                log.info("  Text fields unchanged — keeping existing info embedding.")
+                record["info_embedding"] = existing.get("info_embedding")
 
         status = "new" if existing is None else "updated"
-        return {"status": status, "record": record}
+        return {"status": status, "record": record, "embeds_generated": embeds_generated}
 
     async def run(self) -> None:
         """Run the full scraping pipeline with batch upsert and stale cleanup."""
@@ -1031,6 +1217,9 @@ class AkimboScraper:
         stats_new = 0
         stats_updated = 0
         stats_skipped = 0
+        stats_front_embeds = 0
+        stats_back_embeds = 0
+        stats_info_embeds = 0
 
         start_time = time.time()
 
@@ -1062,6 +1251,15 @@ class AkimboScraper:
                     stats_new += 1
                 else:
                     stats_updated += 1
+
+                # Track embeddings generated
+                embeds = result.get("embeds_generated", {})
+                if embeds.get("front"):
+                    stats_front_embeds += 1
+                if embeds.get("back"):
+                    stats_back_embeds += 1
+                if embeds.get("info"):
+                    stats_info_embeds += 1
 
             # Flush batch when it reaches BATCH_SIZE
             if len(upsert_batch) >= BATCH_SIZE:
@@ -1103,11 +1301,14 @@ class AkimboScraper:
         log.info("=" * 60)
         log.info("RUN SUMMARY")
         log.info("=" * 60)
-        log.info(f"  New products added:     {stats_new}")
-        log.info(f"  Products updated:      {stats_updated}")
-        log.info(f"  Products unchanged:    {stats_skipped}")
-        log.info(f"  Stale products deleted: {stats_deleted}")
-        log.info(f"  Elapsed:               {elapsed:.1f}s")
+        log.info(f"  New products added:       {stats_new}")
+        log.info(f"  Products updated:        {stats_updated}")
+        log.info(f"  Products unchanged:      {stats_skipped}")
+        log.info(f"  Stale products deleted:  {stats_deleted}")
+        log.info(f"  Front embeds generated:  {stats_front_embeds}")
+        log.info(f"  Back embeds generated:   {stats_back_embeds}")
+        log.info(f"  Info embeds generated:   {stats_info_embeds}")
+        log.info(f"  Elapsed:                 {elapsed:.1f}s")
         log.info("=" * 60)
 
         save_progress({
@@ -1116,6 +1317,9 @@ class AkimboScraper:
             "updated": stats_updated,
             "skipped": stats_skipped,
             "deleted": stats_deleted,
+            "front_embeds_generated": stats_front_embeds,
+            "back_embeds_generated": stats_back_embeds,
+            "info_embeds_generated": stats_info_embeds,
             "finished_at": datetime.now(timezone.utc).isoformat(),
         })
 
